@@ -100,7 +100,7 @@ class InstructionsWidget(QWidget):
         # These instructions can be edited by the user if they wish, but the format instructions
         # will be appended automatically and remain hidden from the user.
         self.default_system_instructions = (
-            "You are an expert software engineer. You are tasked with following my instructions. First, I will give you the project files and their contents. Next, I will give you instructions for what code changes to make, followed by constraints for the solution and how to format your answer."
+            "You are an expert software engineer. You are tasked with following my instructions. I will give you instructions for what code changes to make, followed by how to format your answer, and then the project files and their contents."
         )
         
         self.system_edit = QTextEdit()
@@ -153,46 +153,61 @@ class PromptCreationWidget(QWidget):
         system_instructions = self.instructions_widget.get_system_instructions()
         custom_commands = self.custom_commands_edit.toPlainText()
 
-        # Gather selected files info
+        # Hardcoded hidden instructions that we append to ensure the format
+        # and summarize instructions are known to the model
+        hidden_instructions = (
+            "\n\n"
+            "You must produce:\n"
+            "1) A SUMMARY section in Markdown.\n"
+            "   - Provide a brief overall summary.\n"
+            "   - Provide a short summary for each file changed and explain why.\n"
+            "   - Provide a short summary for each file deleted and explain why.\n"
+            "   - This entire summary section should be formatted using Markdown.\n\n"
+            "2) A CHANGES section following the exact format below:\n\n"
+            "SUMMARY:\n"
+            "<Your markdown summary>\n"
+            "CHANGES:\n"
+            "For each file changed:\n"
+            "FILE: <relative/path/to/file>\n"
+            "FILENAME: <filename>\n"
+            "OPERATION: <CREATE|MODIFY|REMOVE>\n"
+            "FULL_CONTENT:\n"
+            "<the entire updated file content if CREATE or MODIFY>\n"
+            "END_CONTENT\n"
+            "(If multiple files, repeat the block above for each file)\n"
+            "END_CHANGES\n"
+        )
+
+        # Get selected files and their contents
         selected_files = self.file_selection_widget.get_selected_files()
-
-        selected_files_str = ""
+        
+        file_structure_str = "Below is the project structure (only the selected files) and their contents.\n\n"
+        file_structure_str += "Selected Project Files:\n"
         for rel_path, _ in selected_files:
-            selected_files_str += f"{rel_path}\n"
-
-        contents_str = ""
+            file_structure_str += f"- {rel_path}\n"
+        file_structure_str += "\nContents of Selected Files:\n"
+        
         for rel_path, full_path in selected_files:
             try:
                 with open(full_path, 'r', encoding='utf-8', errors='ignore') as fp:
                     content = fp.read()
-                contents_str += f"FILE: {rel_path}\n\n{content}\n\n"
+                file_structure_str += f"\nFILE: {rel_path}\n\n{content}\n\n"
             except Exception as e:
-                contents_str += f"FILE: {rel_path}\n\nERROR: Could not read file: {e}\n\n"
+                file_structure_str += f"\nFILE: {rel_path}\n\nERROR: Could not read file: {e}\n\n"
 
-        # Construct the new prompt format
+        # Construct the prompt
         prompt = (
-            f"{system_instructions}\n\n"
-            "<current_code>\n"
-            "Below is the project structure (only the selected files) and their contents.\n\n"
-            "Selected Project Files [this is the ones selected in the ui, the files below are examples]:\n"
-            f"{selected_files_str}\n"
-            "Contents of Selected Files:\n"
-            f"{contents_str}"
-            "</current_code>\n"
-            "<goals> "
-            f"{custom_commands}"
-            " </goals>\n"
-            "<constraints> 1. Retain existing functionality and comments. Do not remove any logic unless explicitly stated. 2. Follow the format specified below for your response: \n"
-            "SUMMARY: <Your markdown summary>\n"
-            "CHANGES: For each file changed:\n"
-            "FILE: <relative/path/to/file>\n"
-            "FILENAME: <filename>\n"
-            "OPERATION: <CREATE|MODIFY|REMOVE>\n"
-            "FULL_CONTENT: <the entire updated file content if CREATE or MODIFY>\n"
-            "END_CONTENT (If multiple files, repeat the block above for each file)\n"
-            "END_CHANGES </constraints>\n"
+            system_instructions 
+            + "\n\nCode Change Instructions:\n"
+            + custom_commands
+            + "\n\nHow to answer:\n"
+            + hidden_instructions
+            + "\n\n"
+            + "Provided project files and their contents:\n"
+            + f"{file_structure_str}\n"
+            + "Remember: After providing the summary (in Markdown), produce exactly the CHANGES section as specified.\n"
         )
-
+        
         # Copy prompt to clipboard
         pyperclip.copy(prompt)
         QMessageBox.information(self, "Prompt Created", "The prompt has been created and copied to clipboard.")
@@ -206,38 +221,19 @@ class PromptCreationWidget(QWidget):
         collecting_content = False
         content_lines = []
 
-        # Pre-process: split lines with multiple keywords
-        keywords = ["FILE:", "FILENAME:", "OPERATION:", "FULL_CONTENT:", "END_CONTENT", "END_CHANGES", "SUMMARY:", "CHANGES:"]
-        processed_lines = []
-        
         for line in lines:
-            while True:
-                # Find the second keyword in the line (if any)
-                positions = [(line.find(kw), kw) for kw in keywords if kw in line]
-                positions.sort()  # Sort by position
-                
-                if len(positions) <= 1:
-                    processed_lines.append(line)
-                    break
-                    
-                # Split at the second keyword
-                pos, keyword = positions[1]
-                processed_lines.append(line[:pos])
-                line = line[pos:]  # Continue processing remainder of line
-
-        # Now process the lines normally
-        for line in processed_lines:
             stripped = line.strip()
             if state == "LOOKING_FOR_SUMMARY":
-                if stripped.startswith("SUMMARY:"):
+                if stripped == "SUMMARY:":
                     state = "IN_SUMMARY"
             elif state == "IN_SUMMARY":
-                if stripped.startswith("CHANGES:"):
+                if stripped == "CHANGES:":
                     state = "IN_CHANGES"
                 else:
                     summary_lines.append(line)
             elif state == "IN_CHANGES":
                 if stripped.startswith("FILE:"):
+                    # If we had a file block in progress, store it first
                     if current_file:
                         if 'full_content' not in current_file and current_file.get('file_operation', 'MODIFY') != 'REMOVE':
                             current_file['full_content'] = ''
@@ -248,26 +244,28 @@ class PromptCreationWidget(QWidget):
                     current_file['filename'] = stripped.replace("FILENAME:", "", 1).strip()
                 elif stripped.startswith("OPERATION:"):
                     current_file['file_operation'] = stripped.replace("OPERATION:", "", 1).strip()
-                elif stripped.startswith("FULL_CONTENT:"):
+                elif stripped == "FULL_CONTENT:":
                     collecting_content = True
                     content_lines = []
                 elif stripped == "END_CONTENT":
                     current_file['full_content'] = "\n".join(content_lines)
                     collecting_content = False
                 elif stripped == "END_CHANGES":
+                    # end of all changes
                     if current_file:
                         if 'full_content' not in current_file and current_file.get('file_operation', 'MODIFY') != 'REMOVE':
                             current_file['full_content'] = ''
                         files_data.append(current_file)
                     break
-                elif collecting_content:
-                    content_lines.append(line)
+                else:
+                    if collecting_content:
+                        content_lines.append(line)
 
         summary = "\n".join(summary_lines).strip()
         return summary, files_data
 
     def apply_results(self):
-        results_text  = self.results_edit.toPlainText().strip()
+        results_text = self.results_edit.toPlainText().strip()
 
         # Parse the LLM response using the custom parser
         summary, files_data = self.parse_llm_response(results_text)
